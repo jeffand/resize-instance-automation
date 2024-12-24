@@ -201,7 +201,6 @@ Write-Host "Performing Windows post-downtime checks..."
 EOF
 
 # Create the template for the SSM Automation document.
-# Note the use of $REPO_NAME in the description below.
 cat > "${REPO_NAME}/modules/ssm_automation/templates/resize_template.yaml" << EOF
 schemaVersion: '0.3'
 description: "Resize an EC2 instance with OS-specific pre/post checks from ${REPO_NAME}"
@@ -216,8 +215,121 @@ parameters:
     type: String
     description: "Role ARN to assume for automation"
     default: ""
+  RetryAttempts:
+    type: String
+    description: "Number of retry attempts for capacity reservation"
+    default: "5"
+  RetryIntervalSeconds:
+    type: String
+    description: "Interval between retry attempts in seconds"
+    default: "30"
+  AvailabilityZone:
+    type: String
+    description: "AZ where capacity reservation should be created"
+  InstancePlatform:
+    type: String
+    description: "Platform for the capacity reservation (e.g., Linux/UNIX)"
+    default: "Linux/UNIX"
+  ReservationName:
+    type: String
+    description: "Name tag for the capacity reservation"
 
 mainSteps:
+  - name: GetInstanceDetails
+    action: aws:executeAwsApi
+    inputs:
+      Service: ec2
+      Api: DescribeInstances
+      InstanceIds:
+        - "{{ InstanceId }}"
+    outputs:
+      - Name: Platform
+        Selector: "$.Reservations[0].Instances[0].Platform"
+        Type: String
+      - Name: AvailabilityZone
+        Selector: "$.Reservations[0].Instances[0].Placement.AvailabilityZone"
+        Type: String
+      - Name: CurrentInstanceType
+        Selector: "$.Reservations[0].Instances[0].InstanceType"
+        Type: String
+    description: "Get details about the instance to be resized"
+    onFailure: "Abort"
+    nextStep: "CreateCapacityReservation"
+
+  - name: CreateCapacityReservation
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.9
+      Handler: retry_handler
+      Script: |
+        import boto3
+        import time
+        import traceback
+        import logging
+
+        logger = logging.getLogger()
+        logger.setLevel(logging.INFO)
+
+        def retry_handler(events, context):
+            ec2 = boto3.client('ec2')
+            retries = int(events['RetryAttempts'])
+            delay = int(events['RetryIntervalSeconds'])
+            instance_type = events['InstanceType']
+            az = events['AvailabilityZone']
+            platform = events['InstancePlatform']
+            reservation_name = events['ReservationName']
+
+            for attempt in range(retries):
+                try:
+                    logger.info(f"Attempt {attempt + 1} to create Capacity Reservation...")
+                    response = ec2.create_capacity_reservation(
+                        InstanceType=instance_type,
+                        InstancePlatform=platform,
+                        AvailabilityZone=az,
+                        InstanceCount=1,
+                        Tenancy="default",
+                        TagSpecifications=[
+                            {
+                                'ResourceType': 'capacity-reservation',
+                                'Tags': [{'Key': 'Name', 'Value': reservation_name}]
+                            }
+                        ]
+                    )
+                    logger.info("Capacity Reservation Created: %s", response['CapacityReservation']['CapacityReservationId'])
+                    return {"Success": True, "CapacityReservationId": response['CapacityReservation']['CapacityReservationId']}
+                except Exception as e:
+                    if "InsufficientCapacity" in str(e):
+                        logger.warning(f"Capacity unavailable. Retrying in {delay} seconds...")
+                        time.sleep(delay)
+                    else:
+                        logger.error("Critical error: %s", str(e))
+                        traceback.print_exc()
+                        return {"Success": False, "Error": str(e)}
+
+            logger.error("All retry attempts failed. Capacity Reservation could not be created.")
+            return {"Success": False, "Error": "Insufficient capacity after all retries."}
+
+      InputPayload:
+        RetryAttempts: "{{ RetryAttempts }}"
+        RetryIntervalSeconds: "{{ RetryIntervalSeconds }}"
+        InstanceType: "{{ TargetInstanceType }}"
+        AvailabilityZone: "{{ AvailabilityZone }}"
+        InstancePlatform: "{{ InstancePlatform }}"
+        ReservationName: "{{ ReservationName }}"
+    description: "Create a Capacity Reservation with retry logic for insufficient capacity"
+
+  - name: VerifyCapacityReservation
+    action: aws:assertAwsResourceProperty
+    inputs:
+      Service: "ec2"
+      Api: "create_capacity_reservation"
+      PropertySelector: "$.Success"
+      DesiredValues:
+        - "True"
+    description: "Verify that the Capacity Reservation was successfully created"
+    onFailure: "Abort"
+    nextStep: "PreDowntimeChecks"
+
   - name: PreDowntimeChecks
     action: aws:runCommand
     inputs:
